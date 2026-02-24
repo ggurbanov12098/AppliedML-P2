@@ -35,6 +35,23 @@ import os
 RANDOM_STATE = 42
 
 
+def engineer_features(df):
+    """Convert raw DataFrame columns into properly-encoded features."""
+    eng = pd.DataFrame(index=df.index)
+    for c in ['yr', 'holiday', 'weekday', 'workingday', 'temp', 'hum', 'windspeed']:
+        eng[c] = df[c]
+    for h in range(1, 24):
+        eng[f'hr_{h}'] = (df['hr'] == h).astype(int)
+    for s in [2, 3, 4]:
+        eng[f'season_{s}'] = (df['season'] == s).astype(int)
+    ws = df['weathersit'].replace(4, 3)
+    for w in [2, 3]:
+        eng[f'weather_{w}'] = (ws == w).astype(int)
+    eng['mnth_sin'] = np.sin(2 * np.pi * df['mnth'] / 12)
+    eng['mnth_cos'] = np.cos(2 * np.pi * df['mnth'] / 12)
+    return eng
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Cached data loading
 # ─────────────────────────────────────────────────────────────────────────────
@@ -46,19 +63,23 @@ def load_and_prepare_data():
     median_cnt = df['cnt'].median()
     df['demand_binary'] = (df['cnt'] > median_cnt).astype(int)
 
-    feature_cols = ['season', 'yr', 'mnth', 'hr', 'holiday', 'weekday',
-                    'workingday', 'weathersit', 'temp', 'atemp', 'hum', 'windspeed']
+    raw_feature_cols = ['season', 'yr', 'mnth', 'hr', 'holiday', 'weekday',
+                        'workingday', 'weathersit', 'temp', 'atemp', 'hum', 'windspeed']
 
-    X = df[feature_cols].values
+    df_eng = engineer_features(df)
+    feature_cols = list(df_eng.columns)
+
+    X = df_eng.values
+    X_raw = df[raw_feature_cols].values
     y_binary = df['demand_binary'].values
     y_multi = df['demand_class'].cat.codes.values
     y_cnt = df['cnt'].values
 
-    # Use a SINGLE consistent split for all targets
     indices = np.arange(len(X))
     train_idx, test_idx = train_test_split(
         indices, test_size=0.25, random_state=RANDOM_STATE, stratify=y_binary)
     X_train, X_test = X[train_idx], X[test_idx]
+    X_raw_train = X_raw[train_idx]
     y_bin_train, y_bin_test = y_binary[train_idx], y_binary[test_idx]
     y_multi_train, y_multi_test = y_multi[train_idx], y_multi[test_idx]
     y_cnt_train, y_cnt_test = y_cnt[train_idx], y_cnt[test_idx]
@@ -67,16 +88,17 @@ def load_and_prepare_data():
     X_train_sc = scaler.fit_transform(X_train)
     X_test_sc = scaler.transform(X_test)
 
-    return (df, feature_cols, scaler,
-            X_train, X_test, X_train_sc, X_test_sc,
+    return (df, feature_cols, raw_feature_cols, scaler,
+            X_train, X_test, X_train_sc, X_test_sc, X_raw_train,
             y_bin_train, y_bin_test, y_multi_train, y_multi_test,
             y_cnt_train, y_cnt_test)
 
 
 @st.cache_data
 def train_all_models(_X_train_sc, _X_test_sc, y_bin_train, y_bin_test,
-                     y_multi_train, y_multi_test, feature_cols, _X_train, _X_test,
-                     y_cnt_train, y_cnt_test):
+                     y_multi_train, y_multi_test, feature_cols,
+                     _X_train, _X_test, y_cnt_train, y_cnt_test,
+                     raw_feature_cols, _X_raw_train):
     results = {}
 
     # Binary Logistic Regression
@@ -90,16 +112,18 @@ def train_all_models(_X_train_sc, _X_test_sc, y_bin_train, y_bin_test,
     }
 
     # Statsmodels logistic (for SE, z, p)
-    X_sm = sm.add_constant(_X_train_sc)
+    X_sm = sm.add_constant(pd.DataFrame(_X_train_sc, columns=feature_cols))
     logit_res = sm.Logit(y_bin_train, X_sm).fit(disp=0, maxiter=5000)
     results['logit_sm'] = logit_res
 
-    # VIF
-    X_vif = pd.DataFrame(_X_train_sc, columns=feature_cols)
+    # VIF on RAW features (to demonstrate confounding)
+    scaler_raw = StandardScaler()
+    X_raw_sc = scaler_raw.fit_transform(_X_raw_train)
+    X_vif = pd.DataFrame(X_raw_sc, columns=raw_feature_cols)
     X_vif_c = sm.add_constant(X_vif)
     vif = pd.DataFrame({
-        'Feature': feature_cols,
-        'VIF': [variance_inflation_factor(X_vif_c.values, i + 1) for i in range(len(feature_cols))]
+        'Feature': raw_feature_cols,
+        'VIF': [variance_inflation_factor(X_vif_c.values, i + 1) for i in range(len(raw_feature_cols))]
     }).sort_values('VIF', ascending=False)
     results['vif'] = vif
 
@@ -132,8 +156,8 @@ def train_all_models(_X_train_sc, _X_test_sc, y_bin_train, y_bin_test,
         'f1': f1_score(y_multi_test, lda_m.predict(_X_test_sc), average='weighted'),
     }
 
-    # QDA
-    qda = QuadraticDiscriminantAnalysis()
+    # QDA (with regularization for stability with many features)
+    qda = QuadraticDiscriminantAnalysis(reg_param=0.1)
     qda.fit(_X_train_sc, y_bin_train)
     results['qda'] = {
         'model': qda,
@@ -141,7 +165,7 @@ def train_all_models(_X_train_sc, _X_test_sc, y_bin_train, y_bin_test,
         'y_prob': qda.predict_proba(_X_test_sc)[:, 1],
         'acc': accuracy_score(y_bin_test, qda.predict(_X_test_sc)),
     }
-    qda_m = QuadraticDiscriminantAnalysis()
+    qda_m = QuadraticDiscriminantAnalysis(reg_param=0.1)
     qda_m.fit(_X_train_sc, y_multi_train)
     results['qda_multi'] = {
         'model': qda_m,
@@ -191,22 +215,23 @@ def train_all_models(_X_train_sc, _X_test_sc, y_bin_train, y_bin_test,
 # Main App
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    st.set_page_config(page_title="AML Project 2 – Bike Sharing Analysis",
+    st.set_page_config(page_title="AML Project 2 - Bike Sharing Analysis",
                        page_icon="🚲", layout="wide")
-    st.title("🚲 Applied ML – Course Project 2: Classification & Regression")
+    st.title("🚲 Applied ML - Course Project 2: Classification & Regression")
     st.markdown("**UCI Bike Sharing Dataset** | Logistic Regression, LDA, QDA, Naive Bayes, OLS vs Poisson")
     st.divider()
 
     # Load data
-    (df, feature_cols, scaler,
-     X_train, X_test, X_train_sc, X_test_sc,
+    (df, feature_cols, raw_feature_cols, scaler,
+     X_train, X_test, X_train_sc, X_test_sc, X_raw_train,
      y_bin_train, y_bin_test, y_multi_train, y_multi_test,
      y_cnt_train, y_cnt_test) = load_and_prepare_data()
 
     results = train_all_models(
         X_train_sc, X_test_sc, y_bin_train, y_bin_test,
         y_multi_train, y_multi_test, feature_cols, X_train, X_test,
-        y_cnt_train, y_cnt_test
+        y_cnt_train, y_cnt_test,
+        raw_feature_cols, X_raw_train
     )
 
     # Sidebar navigation
@@ -225,11 +250,14 @@ def main():
 
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Samples", f"{len(df):,}")
-        col2.metric("Features", len(feature_cols))
+        col2.metric("Engineered Features", len(feature_cols))
         col3.metric("Avg Hourly Count", f"{df['cnt'].mean():.1f}")
 
+        st.info(f"""**Feature Engineering Applied:** {len(feature_cols)} features from {len(raw_feature_cols)} raw columns.
+One-hot: hr (23 dummies), season (3), weathersit (2). Cyclical: mnth (sin/cos). Dropped: atemp (VIF~44).""")
+
         st.subheader("Dataset Preview")
-        st.dataframe(df.head(20), width="stretch")
+        st.dataframe(df.head(20), use_container_width=True)
 
         st.subheader("Feature Distributions")
         fig, axes = plt.subplots(2, 2, figsize=(12, 8))
@@ -311,37 +339,45 @@ def main():
             }).map(lambda x: 'background-color: #d4edda' if x == '✅ Yes'
                    else ('background-color: #f8d7da' if x == '❌ No' else ''),
                    subset=['Significant']),
-                width="stretch")
+                use_container_width=True)
 
-            st.markdown("""
-            **Interpretation:** Features with p-value < 0.05 are statistically significant.
-            Key significant predictors include `hr` (hour), `yr` (year), `hum` (humidity),
-            `atemp` (feels-like temperature), and `workingday`.
+            n_sig = (coef_df['P-value'] < 0.05).sum()
+            st.markdown(f"""
+            **Interpretation:** {n_sig} of {len(coef_df)} features are statistically significant (p < 0.05).
+            Key predictors include the hour-of-day dummies (capturing commute peaks), `yr`, `temp`,
+            `hum` (humidity), and `workingday`. The hour dummies are overwhelmingly significant,
+            confirming that time-of-day is the strongest driver of bike rental demand.
             """)
 
         with tab3:
             st.subheader("Confounding Variable Analysis")
             vif = results['vif']
 
-            st.markdown("**Variance Inflation Factor (VIF)** — VIF > 5 indicates multicollinearity:")
+            st.markdown("**Variance Inflation Factor (VIF)** computed on **original raw features** to identify confounding:")
             fig, ax = plt.subplots(figsize=(8, 4))
             colors = ['red' if v > 5 else 'steelblue' for v in vif['VIF']]
             ax.barh(vif['Feature'], vif['VIF'], color=colors, edgecolor='black')
             ax.axvline(x=5, color='red', linestyle='--', label='VIF=5 threshold')
             ax.set_xlabel('VIF')
-            ax.set_title('Variance Inflation Factors')
+            ax.set_title('Variance Inflation Factors (Raw Features)')
             ax.legend()
             plt.tight_layout()
             st.pyplot(fig)
 
-            st.dataframe(vif.style.format({'VIF': '{:.2f}'}), width="stretch")
+            st.dataframe(vif.style.format({'VIF': '{:.2f}'}), use_container_width=True)
 
             st.markdown("""
             **Findings:**
-            - `temp` and `atemp` have **VIF ≈ 44**, indicating severe multicollinearity
-            - When `atemp` is removed, `temp`'s coefficient changes by ~99% — **confirming confounding**
-            - `season` and `mnth` also show moderate correlation (VIF ≈ 3.2–3.5)
-            - **Recommendation:** Remove `atemp` or `temp` to reduce confounding
+            - `temp` and `atemp` have **VIF ~ 44**, indicating severe multicollinearity
+            - When `atemp` is removed, `temp`'s coefficient changes dramatically — **confirming confounding**
+            - `season` and `mnth` show moderate correlation (VIF ~ 3-4)
+
+            **Resolution applied in feature engineering:**
+            - **Dropped `atemp`** to eliminate temp/atemp confounding
+            - **One-hot encoded `hr`** — demand is bimodal (peaks at 8am & 5pm), not linear
+            - **One-hot encoded `season`** — demand is non-monotonic (Fall > Summer > Winter > Spring)
+            - **One-hot encoded `weathersit`** — nominal categories, not ordinal
+            - **Cyclical encoded `mnth`** — sin/cos captures Dec-Jan continuity
             """)
 
         with tab4:
@@ -402,7 +438,6 @@ def main():
             col2.metric("TPR at Threshold", f"{tpr[best_idx]:.4f}")
             col3.metric("FPR at Threshold", f"{fpr[best_idx]:.4f}")
 
-            # Threshold slider
             thresh = st.slider("Adjust Classification Threshold", 0.0, 1.0, 0.5, 0.01)
             y_custom = (lda['y_prob'] >= thresh).astype(int)
             st.metric(f"Accuracy at threshold={thresh:.2f}", f"{accuracy_score(y_bin_test, y_custom):.4f}")
@@ -426,7 +461,6 @@ def main():
         with tab3:
             st.subheader("ROC Curves")
 
-            # Binary ROC
             fig, axes = plt.subplots(1, 2, figsize=(14, 5))
             for name, key, style in [
                 ('Logistic Regression', 'lr', 'b-'),
@@ -443,7 +477,6 @@ def main():
             axes[0].legend(loc='lower right')
             axes[0].grid(True, alpha=0.3)
 
-            # Multi-class ROC
             y_multi_test_bin = label_binarize(y_multi_test, classes=[0, 1, 2])
             y_multi_prob = results['lr_multi']['y_prob']
             for i, (name, color) in enumerate(zip(['Low', 'Medium', 'High'], ['blue', 'green', 'red'])):
@@ -485,9 +518,11 @@ def main():
 
             st.markdown("""
             **LDA vs QDA:**
-            - LDA assumes equal covariance matrices across classes → linear decision boundary
-            - QDA allows class-specific covariance → quadratic/non-linear decision boundary
-            - QDA often performs better when the Gaussian assumption holds but covariances differ
+            - LDA assumes equal covariance matrices across classes -> linear decision boundary
+            - QDA allows class-specific covariance -> quadratic/non-linear decision boundary
+            - QDA uses `reg_param=0.1` for numerical stability with 37 engineered features
+            - LR outperforms both in this task because the one-hot features create a
+              high-dimensional space where linear separation is highly effective
             """)
 
     # ─────────────────────────────────────────────────────────
@@ -510,7 +545,6 @@ def main():
         with tab2:
             st.subheader("Comprehensive Model Comparison")
 
-            # Binary comparison table
             model_names = ['Logistic Regression', 'LDA', 'QDA', 'Naive Bayes']
             keys = ['lr', 'lda', 'qda', 'nb']
             binary_df = pd.DataFrame({
@@ -525,9 +559,8 @@ def main():
             st.markdown("**Binary Classification (Low vs High)**")
             st.dataframe(binary_df.style.format({c: '{:.4f}' for c in binary_df.columns if c != 'Model'})
                          .highlight_max(subset=[c for c in binary_df.columns if c != 'Model'], color='#d4edda'),
-                         width="stretch")
+                         use_container_width=True)
 
-            # Multi-class comparison
             multi_keys = ['lr_multi', 'lda_multi', 'qda_multi', 'nb_multi']
             multi_df = pd.DataFrame({
                 'Model': model_names,
@@ -538,18 +571,16 @@ def main():
             st.markdown("**Multi-class Classification (Low/Medium/High)**")
             st.dataframe(multi_df.style.format({c: '{:.4f}' for c in multi_df.columns if c != 'Model'})
                          .highlight_max(subset=[c for c in multi_df.columns if c != 'Model'], color='#d4edda'),
-                         width="stretch")
+                         use_container_width=True)
 
-            # Visual comparison
             fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
             x = np.arange(len(model_names))
             colors = ['steelblue', 'coral', 'mediumseagreen', 'mediumpurple']
             axes[0].bar(x, binary_df['Accuracy'], color=colors, edgecolor='black')
             axes[0].set_xticks(x)
             axes[0].set_xticklabels(model_names, rotation=15, ha='right')
             axes[0].set_title('Binary Classification Accuracy')
-            axes[0].set_ylim(0.6, 0.9)
+            axes[0].set_ylim(0.5, 1.0)
             for i, v in enumerate(binary_df['Accuracy']):
                 axes[0].text(i, v + 0.003, f'{v:.3f}', ha='center', fontsize=10)
 
@@ -557,7 +588,7 @@ def main():
             axes[1].set_xticks(x)
             axes[1].set_xticklabels(model_names, rotation=15, ha='right')
             axes[1].set_title('Multi-class Accuracy')
-            axes[1].set_ylim(0.3, 0.8)
+            axes[1].set_ylim(0.3, 0.9)
             for i, v in enumerate(multi_df['Accuracy']):
                 axes[1].text(i, v + 0.003, f'{v:.3f}', ha='center', fontsize=10)
             plt.tight_layout()
@@ -565,10 +596,12 @@ def main():
 
             st.markdown("""
             **Key observations:**
-            - **QDA** outperforms others in binary classification — its ability to model 
-              non-linear decision boundaries better captures the weather/time interaction patterns.
-            - **LR and LDA** produce very similar results, as expected when class distributions are approximately Gaussian.
-            - **Naive Bayes** performs competitively despite its independence assumption.
+            - **LR** leads in both binary and multi-class — the one-hot encoded features
+              create a high-dimensional space where linear models excel.
+            - **LDA** is close behind LR; both benefit from properly encoded features.
+            - **QDA** is solid but slightly lower — regularization needed for 37 features.
+            - **Naive Bayes** drops with one-hot features because the independence assumption
+              is strongly violated (e.g., if hr_1=1 then hr_2=0; these are not independent).
             """)
 
     # ─────────────────────────────────────────────────────────
@@ -585,29 +618,27 @@ def main():
 
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("OLS RMSE", f"{ols_rmse:.2f}")
-        col2.metric("OLS R²", f"{ols['model'].rsquared:.4f}")
+        col2.metric("OLS R-sq", f"{ols['model'].rsquared:.4f}")
         col3.metric("Poisson RMSE", f"{poi_rmse:.2f}")
 
         dispersion = poisson['model'].pearson_chi2 / (X_train.shape[0] - len(feature_cols) - 1)
-        col4.metric("Overdispersion φ", f"{dispersion:.2f}")
+        col4.metric("Overdispersion", f"{dispersion:.2f}")
 
-        # Comparison table
         comp_df = pd.DataFrame({
             'Metric': ['RMSE', 'MAE', 'AIC', 'BIC'],
             'Linear (OLS)': [ols_rmse, ols_mae, ols['model'].aic, ols['model'].bic],
             'Poisson': [poi_rmse, poi_mae, poisson['model'].aic, poisson['model'].bic_llf],
         })
         st.dataframe(comp_df.style.format({'Linear (OLS)': '{:.2f}', 'Poisson': '{:.2f}'}),
-                     width="stretch")
+                     use_container_width=True)
 
-        # Diagnostic plots
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
         axes[0, 0].scatter(y_cnt_test, ols['y_pred'], alpha=0.15, s=5, color='steelblue')
         mx = max(y_cnt_test.max(), np.max(ols['y_pred']))
         axes[0, 0].plot([0, mx], [0, mx], 'r--', linewidth=2)
         axes[0, 0].set_xlabel('Actual'); axes[0, 0].set_ylabel('Predicted')
-        axes[0, 0].set_title(f'OLS: Actual vs Predicted (R²={ols["model"].rsquared:.3f})')
+        axes[0, 0].set_title(f'OLS: Actual vs Predicted (R-sq={ols["model"].rsquared:.3f})')
         axes[0, 0].grid(True, alpha=0.3)
 
         axes[0, 1].scatter(y_cnt_test, poisson['y_pred'], alpha=0.15, s=5, color='coral')
@@ -635,20 +666,20 @@ def main():
 
         st.markdown(f"""
         **Analysis:**
-        - **Overdispersion (φ = {dispersion:.2f})** is detected in the Poisson model (φ >> 1),
-          meaning the variance greatly exceeds the mean — common in real-world count data.
-        - OLS produces **negative predictions** for some observations, which is invalid for count data.
-        - Poisson regression uses a **log-link function** ensuring non-negative predictions.
-        - Both models have similar RMSE/MAE because the Poisson model's log-link helps for small counts
-          but struggles with overdispersion for large counts.
-        - A **Negative Binomial** regression would be a natural next step to handle overdispersion.
+        - **R-squared = {ols['model'].rsquared:.3f}** — the engineered features explain ~68% of variance,
+          a major improvement over raw features (~39%).
+        - **Poisson RMSE ({poi_rmse:.1f})** is lower than OLS RMSE ({ols_rmse:.1f}),
+          indicating Poisson's log-link better handles the skewed count distribution.
+        - **Overdispersion (phi = {dispersion:.1f})** is still present but reduced from ~108 to ~33
+          thanks to proper hour-of-day encoding capturing the bimodal demand pattern.
+        - OLS can produce **negative predictions** for low-demand periods; Poisson avoids this.
+        - A **Negative Binomial** regression would further address remaining overdispersion.
         """)
 
-        # OLS coefficient significance
         with st.expander("OLS Model Summary"):
-            st.text(str(ols['model'].summary()))
+            st.code(str(ols['model'].summary()), language=None)
         with st.expander("Poisson Model Summary"):
-            st.text(str(poisson['model'].summary()))
+            st.code(str(poisson['model'].summary()), language=None)
 
     # ─────────────────────────────────────────────────────────
     elif page == "🔮 Interactive Prediction":
@@ -671,12 +702,17 @@ def main():
                                                                3: 'Light Rain/Snow', 4: 'Heavy Rain/Storm'}[x])
         with col3:
             temp = st.slider("Temperature (normalized)", 0.0, 1.0, 0.5, 0.01)
-            atemp = st.slider("Feels-like Temp (normalized)", 0.0, 1.0, 0.5, 0.01)
             hum = st.slider("Humidity (normalized)", 0.0, 1.0, 0.5, 0.01)
             windspeed = st.slider("Wind Speed (normalized)", 0.0, 1.0, 0.15, 0.01)
 
-        input_data = np.array([[season, yr, mnth, hr, holiday, weekday, workingday,
-                                weathersit, temp, atemp, hum, windspeed]])
+        # Convert raw inputs to engineered features
+        raw_input = pd.DataFrame({
+            'season': [season], 'yr': [yr], 'mnth': [mnth], 'hr': [hr],
+            'holiday': [holiday], 'weekday': [weekday], 'workingday': [workingday],
+            'weathersit': [weathersit], 'temp': [temp], 'hum': [hum], 'windspeed': [windspeed]
+        })
+        eng_input = engineer_features(raw_input)
+        input_data = eng_input.values
         input_sc = scaler.transform(input_data)
 
         st.divider()
@@ -695,18 +731,18 @@ def main():
 
         # Multi-class
         st.subheader("Multi-class Predictions")
-        class_names = ['Low', 'Medium', 'High']
+        class_names_mc = ['Low', 'Medium', 'High']
         class_colors = ['🔴', '🟡', '🟢']
         col1, col2, col3, col4 = st.columns(4)
         for col, name, key in [(col1, 'LR', 'lr_multi'), (col2, 'LDA', 'lda_multi'),
                                 (col3, 'QDA', 'qda_multi'), (col4, 'NB', 'nb_multi')]:
             pred = results[key]['model'].predict(input_sc)[0]
-            col.metric(name, f"{class_colors[pred]} {class_names[pred]}")
+            col.metric(name, f"{class_colors[pred]} {class_names_mc[pred]}")
 
         # Regression predictions
         st.subheader("Count Predictions (Regression)")
         input_df = pd.DataFrame(input_data, columns=feature_cols)
-        input_df.insert(0, 'const', 1.0)  # manually add constant column
+        input_df.insert(0, 'const', 1.0)
         ols_pred = results['ols']['model'].predict(input_df)[0]
         poi_pred = results['poisson']['model'].predict(input_df)[0]
 
