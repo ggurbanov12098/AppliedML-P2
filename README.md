@@ -3,6 +3,10 @@
 
 **Course:** CSCI-6767 Applied Machine Learning & Data Analytics (Spring 2026)
 
+
+#### Presentation Slides  
+https://www.canva.com/design/DAHCPAAyhLc/GWXExTK9Kcopdyr8NN50Ww/edit
+
 ---
 
 ## 1. Motivation
