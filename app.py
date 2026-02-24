@@ -54,12 +54,14 @@ def load_and_prepare_data():
     y_multi = df['demand_class'].cat.codes.values
     y_cnt = df['cnt'].values
 
-    X_train, X_test, y_bin_train, y_bin_test = train_test_split(
-        X, y_binary, test_size=0.25, random_state=RANDOM_STATE, stratify=y_binary)
-    _, _, y_multi_train, y_multi_test = train_test_split(
-        X, y_multi, test_size=0.25, random_state=RANDOM_STATE, stratify=y_multi)
-    _, _, y_cnt_train, y_cnt_test = train_test_split(
-        X, y_cnt, test_size=0.25, random_state=RANDOM_STATE)
+    # Use a SINGLE consistent split for all targets
+    indices = np.arange(len(X))
+    train_idx, test_idx = train_test_split(
+        indices, test_size=0.25, random_state=RANDOM_STATE, stratify=y_binary)
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_bin_train, y_bin_test = y_binary[train_idx], y_binary[test_idx]
+    y_multi_train, y_multi_test = y_multi[train_idx], y_multi[test_idx]
+    y_cnt_train, y_cnt_test = y_cnt[train_idx], y_cnt[test_idx]
 
     scaler = StandardScaler()
     X_train_sc = scaler.fit_transform(X_train)
@@ -227,7 +229,7 @@ def main():
         col3.metric("Avg Hourly Count", f"{df['cnt'].mean():.1f}")
 
         st.subheader("Dataset Preview")
-        st.dataframe(df.head(20), use_container_width=True)
+        st.dataframe(df.head(20), width="stretch")
 
         st.subheader("Feature Distributions")
         fig, axes = plt.subplots(2, 2, figsize=(12, 8))
@@ -306,10 +308,10 @@ def main():
             st.dataframe(coef_df.style.format({
                 'Coefficient': '{:.4f}', 'Std Error': '{:.4f}',
                 'Z-statistic': '{:.4f}', 'P-value': '{:.6f}'
-            }).applymap(lambda x: 'background-color: #d4edda' if x == '✅ Yes'
-                        else ('background-color: #f8d7da' if x == '❌ No' else ''),
-                        subset=['Significant']),
-                use_container_width=True)
+            }).map(lambda x: 'background-color: #d4edda' if x == '✅ Yes'
+                   else ('background-color: #f8d7da' if x == '❌ No' else ''),
+                   subset=['Significant']),
+                width="stretch")
 
             st.markdown("""
             **Interpretation:** Features with p-value < 0.05 are statistically significant.
@@ -332,7 +334,7 @@ def main():
             plt.tight_layout()
             st.pyplot(fig)
 
-            st.dataframe(vif.style.format({'VIF': '{:.2f}'}), use_container_width=True)
+            st.dataframe(vif.style.format({'VIF': '{:.2f}'}), width="stretch")
 
             st.markdown("""
             **Findings:**
@@ -523,7 +525,7 @@ def main():
             st.markdown("**Binary Classification (Low vs High)**")
             st.dataframe(binary_df.style.format({c: '{:.4f}' for c in binary_df.columns if c != 'Model'})
                          .highlight_max(subset=[c for c in binary_df.columns if c != 'Model'], color='#d4edda'),
-                         use_container_width=True)
+                         width="stretch")
 
             # Multi-class comparison
             multi_keys = ['lr_multi', 'lda_multi', 'qda_multi', 'nb_multi']
@@ -536,7 +538,7 @@ def main():
             st.markdown("**Multi-class Classification (Low/Medium/High)**")
             st.dataframe(multi_df.style.format({c: '{:.4f}' for c in multi_df.columns if c != 'Model'})
                          .highlight_max(subset=[c for c in multi_df.columns if c != 'Model'], color='#d4edda'),
-                         use_container_width=True)
+                         width="stretch")
 
             # Visual comparison
             fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -596,7 +598,7 @@ def main():
             'Poisson': [poi_rmse, poi_mae, poisson['model'].aic, poisson['model'].bic_llf],
         })
         st.dataframe(comp_df.style.format({'Linear (OLS)': '{:.2f}', 'Poisson': '{:.2f}'}),
-                     use_container_width=True)
+                     width="stretch")
 
         # Diagnostic plots
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -704,9 +706,9 @@ def main():
         # Regression predictions
         st.subheader("Count Predictions (Regression)")
         input_df = pd.DataFrame(input_data, columns=feature_cols)
-        input_c = sm.add_constant(input_df)
-        ols_pred = results['ols']['model'].predict(input_c)[0]
-        poi_pred = results['poisson']['model'].predict(input_c)[0]
+        input_df.insert(0, 'const', 1.0)  # manually add constant column
+        ols_pred = results['ols']['model'].predict(input_df)[0]
+        poi_pred = results['poisson']['model'].predict(input_df)[0]
 
         col1, col2 = st.columns(2)
         col1.metric("Linear (OLS) Prediction", f"{max(0, ols_pred):.0f} bikes")

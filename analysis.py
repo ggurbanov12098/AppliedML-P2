@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
 
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
 from sklearn.preprocessing import StandardScaler, label_binarize
 from sklearn.linear_model import LogisticRegression
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
@@ -76,16 +76,15 @@ y_binary = df['demand_binary'].values
 y_multi = df['demand_class'].cat.codes.values  # 0=Low, 1=Medium, 2=High
 y_cnt = df['cnt'].values  # continuous target for regression
 
-# Train-test split
-X_train, X_test, y_bin_train, y_bin_test = train_test_split(
-    X, y_binary, test_size=0.25, random_state=RANDOM_STATE, stratify=y_binary
+# Train-test split — use a SINGLE consistent split for all targets
+indices = np.arange(len(X))
+train_idx, test_idx = train_test_split(
+    indices, test_size=0.25, random_state=RANDOM_STATE, stratify=y_binary
 )
-_, _, y_multi_train, y_multi_test = train_test_split(
-    X, y_multi, test_size=0.25, random_state=RANDOM_STATE, stratify=y_multi
-)
-_, _, y_cnt_train, y_cnt_test = train_test_split(
-    X, y_cnt, test_size=0.25, random_state=RANDOM_STATE
-)
+X_train, X_test = X[train_idx], X[test_idx]
+y_bin_train, y_bin_test = y_binary[train_idx], y_binary[test_idx]
+y_multi_train, y_multi_test = y_multi[train_idx], y_multi[test_idx]
+y_cnt_train, y_cnt_test = y_cnt[train_idx], y_cnt[test_idx]
 
 # Scale features
 scaler = StandardScaler()
@@ -192,7 +191,7 @@ print("- High VIF (>5) for temp/atemp confirms multicollinearity → confounding
 print("\nDemonstrating confounding effect of 'atemp' on 'temp':")
 feature_cols_no_atemp = [c for c in feature_cols if c != 'atemp']
 X_no_atemp = df[feature_cols_no_atemp].values
-X_train_na, X_test_na = train_test_split(X_no_atemp, test_size=0.25, random_state=RANDOM_STATE)
+X_train_na = X_no_atemp[train_idx]  # use same indices as main split
 scaler_na = StandardScaler()
 X_train_na_sc = scaler_na.fit_transform(X_train_na)
 X_train_na_sm = sm.add_constant(X_train_na_sc)
@@ -459,10 +458,11 @@ models = {
     'Naive Bayes': GaussianNB()
 }
 
-X_all_sc = scaler.fit_transform(X)
+X_all_sc = StandardScaler().fit_transform(X)  # separate scaler to avoid overwriting
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
 cv_results = {}
 for name, model in models.items():
-    scores = cross_val_score(model, X_all_sc, y_binary, cv=5, scoring='accuracy')
+    scores = cross_val_score(model, X_all_sc, y_binary, cv=cv, scoring='accuracy')
     cv_results[name] = scores
     print(f"  {name:25s}: Mean={scores.mean():.4f} ± {scores.std():.4f}")
 
